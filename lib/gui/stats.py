@@ -10,7 +10,8 @@ from math import ceil, sqrt
 
 import numpy as np
 import tensorflow as tf
-from lib.Serializer import JSONSerializer
+from tensorflow.python import errors_impl as tf_errors  # pylint:disable=no-name-in-module
+from lib.serializer import get_serializer
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -86,20 +87,27 @@ class TensorBoardLogs():
             if session is not None and sess != session:
                 logger.debug("Skipping sessions: %s", sess)
                 continue
-            for logfile in sides.values():
-                timestamps = [event.wall_time
-                              for event in tf.train.summary_iterator(logfile)]
-                logger.debug("Total timestamps for session %s: %s", sess, len(timestamps))
-                all_timestamps[sess] = timestamps
-                break  # break after first file read
+            try:
+                for logfile in sides.values():
+                    timestamps = [event.wall_time
+                                  for event in tf.train.summary_iterator(logfile)
+                                  if event.summary.value]
+                    logger.debug("Total timestamps for session %s: %s", sess, len(timestamps))
+                    all_timestamps[sess] = timestamps
+                    break  # break after first file read
+            except tf_errors.DataLossError as err:
+                logger.warning("The logs for Session %s are corrupted and cannot be displayed. "
+                               "The totals do not include this session. Original error message: "
+                               "'%s'", sess, str(err))
         return all_timestamps
 
 
 class Session():
     """ The Loaded or current training session """
     def __init__(self, model_dir=None, model_name=None):
-        logger.debug("Initializing %s", self.__class__.__name__)
-        self.serializer = JSONSerializer
+        logger.debug("Initializing %s: (model_dir: %s, model_name: %s)",
+                     self.__class__.__name__, model_dir, model_name)
+        self.serializer = get_serializer("json")
         self.state = None
         self.modeldir = model_dir  # Set and reset by wrapper for training sessions
         self.modelname = model_name  # Set and reset by wrapper for training sessions
@@ -117,7 +125,7 @@ class Session():
     @property
     def config(self):
         """ Return config and other information """
-        retval = {key: val for key, val in self.state["config"]}
+        retval = self.state["config"].copy()
         retval["training_size"] = self.state["training_size"]
         retval["input_size"] = [val[0] for key, val in self.state["inputs"].items()
                                 if key.startswith("face")][0]
@@ -136,7 +144,7 @@ class Session():
     @property
     def logging_disabled(self):
         """ Return whether logging is disabled for this session """
-        return self.session["no_logs"]
+        return self.session["no_logs"] or self.session["pingpong"]
 
     @property
     def loss(self):
@@ -162,7 +170,7 @@ class Session():
     @property
     def session(self):
         """ Return current session dictionary """
-        return self.state["sessions"][str(self.session_id)]
+        return self.state["sessions"].get(str(self.session_id), dict())
 
     @property
     def session_ids(self):
@@ -190,8 +198,9 @@ class Session():
     def total_loss(self):
         """ Return collated loss for all session """
         loss_dict = dict()
-        for sess in self.tb_logs.get_loss().values():
-            for loss_key, side_loss in sess.items():
+        all_loss = self.tb_logs.get_loss()
+        for key in sorted(int(idx) for idx in all_loss):
+            for loss_key, side_loss in all_loss[key].items():
                 for side, loss in side_loss.items():
                     loss_dict.setdefault(loss_key, dict()).setdefault(side, list()).extend(loss)
         return loss_dict
@@ -222,19 +231,22 @@ class Session():
         else:
             self.session_id = session_id
         self.initialized = True
-        logger.debug("Initialized session")
+        logger.debug("Initialized session. Session_ID: %s", self.session_id)
 
     def load_state_file(self):
         """ Load the current state file """
         state_file = os.path.join(self.modeldir, "{}_state.json".format(self.modelname))
         logger.debug("Loading State: '%s'", state_file)
-        try:
-            with open(state_file, "rb") as inp:
-                state = self.serializer.unmarshal(inp.read().decode("utf-8"))
-                self.state = state
-                logger.debug("Loaded state: %s", state)
-        except IOError as err:
-            logger.warning("Unable to load state file. Graphing disabled: %s", str(err))
+        self.state = self.serializer.load(state_file)
+        logger.debug("Loaded state: %s", self.state)
+
+    def get_iterations_for_session(self, session_id):
+        """ Return the number of iterations for the given session id """
+        session = self.state["sessions"].get(str(session_id), None)
+        if session is None:
+            logger.warning("No session data found for session id: %s", session_id)
+            return 0
+        return session["iterations"]
 
 
 class SessionsSummary():
@@ -249,9 +261,9 @@ class SessionsSummary():
     def time_stats(self):
         """ Return session time stats """
         ts_data = self.session.tb_logs.get_timestamps()
-        time_stats = {sess_id: {"start_time": min(timestamps),
-                                "end_time": max(timestamps),
-                                "iterations": len(timestamps)}
+        time_stats = {sess_id: {"start_time": min(timestamps) if timestamps else 0,
+                                "end_time": max(timestamps) if timestamps else 0,
+                                "datapoints": len(timestamps) if timestamps else 0}
                       for sess_id, timestamps in ts_data.items()}
         return time_stats
 
@@ -260,21 +272,30 @@ class SessionsSummary():
         """ Return compiled stats """
         compiled = list()
         for sess_idx, ts_data in self.time_stats.items():
+            logger.debug("Compiling session ID: %s", sess_idx)
+            if self.session.state is None:
+                logger.debug("Session state dict doesn't exist. Most likely task has been "
+                             "terminated during compilation")
+                return None
+            iterations = self.session.get_iterations_for_session(sess_idx)
             elapsed = ts_data["end_time"] - ts_data["start_time"]
-            batchsize = self.session.total_batchsize[sess_idx]
+            batchsize = self.session.total_batchsize.get(sess_idx, 0)
             compiled.append({"session": sess_idx,
                              "start": ts_data["start_time"],
                              "end": ts_data["end_time"],
                              "elapsed": elapsed,
-                             "rate": (batchsize * ts_data["iterations"]) / elapsed,
+                             "rate": (batchsize * iterations) / elapsed if elapsed != 0 else 0,
                              "batch": batchsize,
-                             "iterations": ts_data["iterations"]})
+                             "iterations": iterations})
+        compiled = sorted(compiled, key=lambda k: k["session"])
         return compiled
 
     def compile_stats(self):
         """ Compile sessions stats with totals, format and return """
         logger.debug("Compiling sessions summary data")
         compiled_stats = self.sessions_stats
+        if compiled_stats is None:
+            return compiled_stats
         logger.debug("sessions_stats: %s", compiled_stats)
         total_stats = self.total_stats(compiled_stats)
         compiled_stats.append(total_stats)
@@ -287,9 +308,9 @@ class SessionsSummary():
         """ Return total stats """
         logger.debug("Compiling Totals")
         elapsed = 0
-        rate = 0
-        batchset = set()
+        examples = 0
         iterations = 0
+        batchset = set()
         total_summaries = len(sessions_stats)
         for idx, summary in enumerate(sessions_stats):
             if idx == 0:
@@ -297,7 +318,7 @@ class SessionsSummary():
             if idx == total_summaries - 1:
                 endtime = summary["end"]
             elapsed += summary["elapsed"]
-            rate += summary["rate"]
+            examples += (summary["batch"] * summary["iterations"])
             batchset.add(summary["batch"])
             iterations += summary["iterations"]
         batch = ",".join(str(bs) for bs in batchset)
@@ -305,7 +326,7 @@ class SessionsSummary():
                   "start": starttime,
                   "end": endtime,
                   "elapsed": elapsed,
-                  "rate": rate / total_summaries,
+                  "rate": examples / elapsed if elapsed != 0 else 0,
                   "batch": batch,
                   "iterations": iterations}
         logger.debug(totals)
@@ -317,8 +338,8 @@ class SessionsSummary():
         logger.debug("Formatting stats")
         for summary in compiled_stats:
             hrs, mins, secs = convert_time(summary["elapsed"])
-            summary["start"] = time.strftime("%x %X", time.gmtime(summary["start"]))
-            summary["end"] = time.strftime("%x %X", time.gmtime(summary["end"]))
+            summary["start"] = time.strftime("%x %X", time.localtime(summary["start"]))
+            summary["end"] = time.strftime("%x %X", time.localtime(summary["end"]))
             summary["elapsed"] = "{}:{}:{}".format(hrs, mins, secs)
             summary["rate"] = "{0:.1f}".format(summary["rate"])
         return compiled_stats
@@ -327,11 +348,11 @@ class SessionsSummary():
 class Calculations():
     """ Class to pull raw data for given session(s) and perform calculations """
     def __init__(self, session, display="loss", loss_keys=["loss"], selections=["raw"],
-                 avg_samples=10, flatten_outliers=False, is_totals=False):
+                 avg_samples=500, smooth_amount=0.90, flatten_outliers=False, is_totals=False):
         logger.debug("Initializing %s: (session: %s, display: %s, loss_keys: %s, selections: %s, "
-                     "avg_samples: %s, flatten_outliers: %s, is_totals: %s",
+                     "avg_samples: %s, smooth_amount: %s, flatten_outliers: %s, is_totals: %s",
                      self.__class__.__name__, session, display, loss_keys, selections, avg_samples,
-                     flatten_outliers, is_totals)
+                     smooth_amount, flatten_outliers, is_totals)
 
         warnings.simplefilter("ignore", np.RankWarning)
 
@@ -340,7 +361,8 @@ class Calculations():
         self.loss_keys = loss_keys
         self.selections = selections
         self.is_totals = is_totals
-        self.args = {"avg_samples": int(avg_samples),
+        self.args = {"avg_samples": avg_samples,
+                     "smooth_amount": smooth_amount,
                      "flatten_outliers": flatten_outliers}
         self.iterations = 0
         self.stats = None
@@ -352,12 +374,13 @@ class Calculations():
         logger.debug("Refreshing")
         if not self.session.initialized:
             logger.warning("Session data is not initialized. Not refreshing")
-            return
+            return None
         self.iterations = 0
         self.stats = self.get_raw()
         self.get_calculations()
         self.remove_raw()
         logger.debug("Refreshed")
+        return self
 
     def get_raw(self):
         """ Add raw data to stats dict """
@@ -380,7 +403,7 @@ class Calculations():
             if len(iterations) > 1:
                 # Crop all losses to the same number of items
                 if self.iterations == 0:
-                    raw = {lossname: list() for lossname in raw.keys()}
+                    raw = {lossname: list() for lossname in raw}
                 else:
                     raw = {lossname: loss[:self.iterations] for lossname, loss in raw.items()}
 
@@ -427,6 +450,9 @@ class Calculations():
             batchsize = batchsizes[sess_id]
             timestamps = total_timestamps[sess_id]
             iterations = range(len(timestamps) - 1)
+            print("===========\n")
+            print(timestamps[:100])
+            print([batchsize / (timestamps[i + 1] - timestamps[i]) for i in iterations][:100])
             rate.extend([batchsize / (timestamps[i + 1] - timestamps[i]) for i in iterations])
         logger.debug("Calculated totals rate: Item_count: %s", len(rate))
         return rate
@@ -445,7 +471,7 @@ class Calculations():
             if (mean - limit) <= item <= (mean + limit):
                 retdata.append(item)
             else:
-                logger.debug("Item idx: %s, value: %s flattened to %s", idx, item, mean)
+                logger.trace("Item idx: %s, value: %s flattened to %s", idx, item, mean)
                 retdata.append(mean)
         logger.debug("Flattened outliers")
         return retdata
@@ -478,12 +504,22 @@ class Calculations():
             if idx < presample or idx >= datapoints - postsample:
                 avgs.append(None)
                 continue
-            else:
-                avg = sum(data[idx - presample:idx + postsample]) \
-                        / self.args["avg_samples"]
-                avgs.append(avg)
+            avg = sum(data[idx - presample:idx + postsample]) / self.args["avg_samples"]
+            avgs.append(avg)
         logger.debug("Calculated Average")
         return avgs
+
+    def calc_smoothed(self, data):
+        """ Smooth the data """
+        last = data[0]  # First value in the plot (first timestep)
+        weight = self.args["smooth_amount"]
+        smoothed = list()
+        for point in data:
+            smoothed_val = last * weight + (1 - weight) * point  # Calculate smoothed value
+            smoothed.append(smoothed_val)                        # Save it
+            last = smoothed_val                                  # Anchor the last smoothed value
+
+        return smoothed
 
     @staticmethod
     def calc_trend(data):
