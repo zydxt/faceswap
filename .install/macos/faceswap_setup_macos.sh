@@ -15,7 +15,7 @@ DIR_CONDA="$HOME/miniconda3"
 CONDA_EXECUTABLE="${DIR_CONDA}/bin/conda"
 CONDA_TO_PATH=false
 ENV_NAME="faceswap"
-PYENV_VERSION="3.10"
+PYENV_VERSION="3.13"
 
 DIR_FACESWAP="$HOME/faceswap"
 VERSION="nvidia"
@@ -379,10 +379,11 @@ conda_install() {
         info "Installing Miniconda3..."
         yellow ; fname="$(basename -- $DL_CONDA)"
         bash "$TMP_DIR/$fname" -b -p "$DIR_CONDA"
+        "$CONDA_EXECUTABLE" tos accept
         if $CONDA_TO_PATH ; then
             info "Adding Miniconda3 to PATH..."
             yellow ; "$CONDA_EXECUTABLE" init zsh bash
-            "$CONDA_EXECUTABLE" config --set auto_activate_base false
+            "$CONDA_EXECUTABLE" config --set auto_activate false
         fi
     fi
 }
@@ -404,10 +405,10 @@ delete_env() {
 }
 
 create_env() {
-    # Create Python 3.10 env for faceswap
+    # Create Python 3.13 env for faceswap
     delete_env
     info "Creating Conda Virtual Environment..."
-    yellow ; "$CONDA_EXECUTABLE" create -n "$ENV_NAME" -q python="$PYENV_VERSION" -y
+    yellow ; "$CONDA_EXECUTABLE" create -n "$ENV_NAME" -c conda-forge -q python="$PYENV_VERSION" -y
 }
 
 

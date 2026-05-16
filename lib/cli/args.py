@@ -9,14 +9,19 @@ import sys
 import textwrap
 import typing as T
 
-from lib.utils import get_backend
+from lib.utils import get_backend, get_module_objects
 from lib.gpu_stats import GPUStats
 
 from .actions import FileFullPaths, MultiOption, SaveFileFullPaths
 from .launcher import ScriptExecutor
 
 logger = logging.getLogger(__name__)
-_GPUS = GPUStats().cli_devices
+
+
+if GPUStats is None:
+    _GPUS = []
+else:
+    _GPUS = GPUStats().cli_devices
 
 # LOCALES
 _LANG = gettext.translation("lib.cli.args", localedir="locales", fallback=True)
@@ -197,9 +202,10 @@ class FaceSwapArgs():
             "action": FileFullPaths,
             "filetypes": "ini",
             "type": str,
+            "dest": "config_file",
             "group": _("Global Options"),
             "help": _(
-                "Optionally overide the saved config with the path to a custom config file.")})
+                "Optionally override the saved config with the path to a custom config file.")})
         global_args.append({
             "opts": ("-L", "--loglevel"),
             "type": str.upper,
@@ -221,20 +227,11 @@ class FaceSwapArgs():
             "help": _("Path to store the logfile. Leave blank to store in the faceswap folder")})
         # These are hidden arguments to indicate that the GUI/Colab is being used
         global_args.append({
-            "opts": ("-gui", "--gui"),
+            "opts": ("-G", "--gui"),
             "action": "store_true",
             "dest": "redirect_gui",
             "default": False,
             "help": argparse.SUPPRESS})
-        # Deprecated multi-character switches
-        global_args.append({
-            "opts": ("-LF",),
-            "action": SaveFileFullPaths,
-            "filetypes": 'log',
-            "type": str,
-            "dest": "depr_logfile_LF_F",
-            "help": argparse.SUPPRESS})
-
         return global_args
 
     @staticmethod
@@ -313,3 +310,6 @@ class GuiArgs(FaceSwapArgs):
             "default": False,
             "help": _("Output to Shell console instead of GUI console")})
         return argument_list
+
+
+__all__ = get_module_objects(__name__)

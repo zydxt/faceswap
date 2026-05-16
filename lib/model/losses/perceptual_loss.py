@@ -1,734 +1,410 @@
 #!/usr/bin/env python3
-""" TF Keras implementation of Perceptual Loss Functions for faceswap.py """
+"""Keras implementation of Perceptual Loss Functions for faceswap.py """
+from __future__ import annotations
 
 import logging
-import typing as T
 
 import numpy as np
-import tensorflow as tf
+import torch
+from torch import nn
+from torch.nn import functional as F
 
-# Ignore linting errors from Tensorflow's thoroughly broken import system
-from tensorflow.keras import backend as K  # pylint:disable=import-error
+from lib.logger import parse_class_init
+from lib.utils import FaceswapError, get_module_objects
 
-from lib.keras_utils import ColorSpaceConvert, frobenius_norm, replicate_pad
 
 logger = logging.getLogger(__name__)
 
 
-class DSSIMObjective():  # pylint:disable=too-few-public-methods
-    """ DSSIM Loss Functions
+class GMSDLoss(nn.Module):
+    """Gradient Magnitude Similarity Deviation Loss.
 
-    Difference of Structural Similarity (DSSIM loss function).
-
-    Adapted from :func:`tensorflow.image.ssim` for a pure keras implentation.
-
-    Notes
-    -----
-    Channels last only. Assumes all input images are the same size and square
+    Improved image quality metric over MS-SSIM with easier calculations
 
     Parameters
     ----------
-    k_1: float, optional
-        Parameter of the SSIM. Default: `0.01`
-    k_2: float, optional
-        Parameter of the SSIM. Default: `0.03`
-    filter_size: int, optional
-        size of gaussian filter Default: `11`
-    filter_sigma: float, optional
-        Width of gaussian filter Default: `1.5`
-    max_value: float, optional
-        Max value of the output. Default: `1.0`
-
-    Notes
-    ------
-    You should add a regularization term like a l2 loss in addition to this one.
-    """
-    def __init__(self,
-                 k_1: float = 0.01,
-                 k_2: float = 0.03,
-                 filter_size: int = 11,
-                 filter_sigma: float = 1.5,
-                 max_value: float = 1.0) -> None:
-        self._filter_size = filter_size
-        self._filter_sigma = filter_sigma
-        self._kernel = self._get_kernel()
-
-        compensation = 1.0
-        self._c1 = (k_1 * max_value) ** 2
-        self._c2 = ((k_2 * max_value) ** 2) * compensation
-
-    def _get_kernel(self) -> tf.Tensor:
-        """ Obtain the base kernel for performing depthwise convolution.
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The gaussian kernel based on selected size and sigma
-        """
-        coords = np.arange(self._filter_size, dtype="float32")
-        coords -= (self._filter_size - 1) / 2.
-
-        kernel = np.square(coords)
-        kernel *= -0.5 / np.square(self._filter_sigma)
-        kernel = np.reshape(kernel, (1, -1)) + np.reshape(kernel, (-1, 1))
-        kernel = K.constant(np.reshape(kernel, (1, -1)))
-        kernel = K.softmax(kernel)
-        kernel = K.reshape(kernel, (self._filter_size, self._filter_size, 1, 1))
-        return kernel
-
-    @classmethod
-    def _depthwise_conv2d(cls, image: tf.Tensor, kernel: tf.Tensor) -> tf.Tensor:
-        """ Perform a standardized depthwise convolution.
-
-        Parameters
-        ----------
-        image: :class:`tf.Tensor`
-            Batch of images, channels last, to perform depthwise convolution
-        kernel: :class:`tf.Tensor`
-            convolution kernel
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The output from the convolution
-        """
-        return K.depthwise_conv2d(image, kernel, strides=(1, 1), padding="valid")
-
-    def _get_ssim(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        """ Obtain the structural similarity between a batch of true and predicted images.
-
-        Parameters
-        ----------
-        y_true: :class:`tf.Tensor`
-            The input batch of ground truth images
-        y_pred: :class:`tf.Tensor`
-            The input batch of predicted images
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The SSIM for the given images
-        :class:`tf.Tensor`
-            The Contrast for the given images
-        """
-        channels = K.int_shape(y_true)[-1]
-        kernel = K.tile(self._kernel, (1, 1, channels, 1))
-
-        # SSIM luminance measure is (2 * mu_x * mu_y + c1) / (mu_x ** 2 + mu_y ** 2 + c1)
-        mean_true = self._depthwise_conv2d(y_true, kernel)
-        mean_pred = self._depthwise_conv2d(y_pred, kernel)
-        num_lum = mean_true * mean_pred * 2.0
-        den_lum = K.square(mean_true) + K.square(mean_pred)
-        luminance = (num_lum + self._c1) / (den_lum + self._c1)
-
-        # SSIM contrast-structure measure is (2 * cov_{xy} + c2) / (cov_{xx} + cov_{yy} + c2)
-        num_con = self._depthwise_conv2d(y_true * y_pred, kernel) * 2.0
-        den_con = self._depthwise_conv2d(K.square(y_true) + K.square(y_pred), kernel)
-
-        contrast = (num_con - num_lum + self._c2) / (den_con - den_lum + self._c2)
-
-        # Average over the height x width dimensions
-        axes = (-3, -2)
-        ssim = K.mean(luminance * contrast, axis=axes)
-        contrast = K.mean(contrast, axis=axes)
-
-        return ssim, contrast
-
-    def __call__(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Call the DSSIM  or MS-DSSIM Loss Function.
-
-        Parameters
-        ----------
-        y_true: :class:`tf.Tensor`
-            The input batch of ground truth images
-        y_pred: :class:`tf.Tensor`
-            The input batch of predicted images
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The DSSIM or MS-DSSIM for the given images
-        """
-        ssim = self._get_ssim(y_true, y_pred)[0]
-        retval = (1. - ssim) / 2.0
-        return K.mean(retval)
-
-
-class GMSDLoss():  # pylint:disable=too-few-public-methods
-    """ Gradient Magnitude Similarity Deviation Loss.
-
-    Improved image quality metric over MS-SSIM with easier calculations
+    spatial_output
+        ``True`` to output the loss values spatially. ``False`` as scalar per item.
+        Default: ``True``
 
     References
     ----------
     http://www4.comp.polyu.edu.hk/~cslzhang/IQA/GMSD/GMSD.htm
     https://arxiv.org/ftp/arxiv/papers/1308/1308.3052.pdf
     """
-    def __call__(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Return the Gradient Magnitude Similarity Deviation Loss.
+    _scharr_edges: torch.Tensor
+
+    def __init__(self, spatial_output: bool = True) -> None:
+        logger.debug(parse_class_init(locals()))
+        super().__init__()
+        self._spatial = spatial_output
+        self.register_buffer("_scharr_edges", torch.from_numpy(
+            np.array([[[[0.00070, 0.00070]],
+                       [[0.00520, 0.00370]],
+                       [[0.03700, 0.00000]],
+                       [[0.00520, -0.0037]],
+                       [[0.00070, -0.0007]]],
+                      [[[0.00370, 0.00520]],
+                       [[0.11870, 0.11870]],
+                       [[0.25890, 0.00000]],
+                       [[0.11870, -0.1187]],
+                       [[0.00370, -0.0052]]],
+                      [[[0.00000, 0.03700]],
+                       [[0.00000, 0.25890]],
+                       [[0.00000, 0.00000]],
+                       [[0.00000, -0.2589]],
+                       [[0.00000, -0.0370]]],
+                      [[[-0.0037, 0.00520]],
+                       [[-0.1187, 0.11870]],
+                       [[-0.2589, 0.00000]],
+                       [[-0.1187, -0.1187]],
+                       [[-0.0037, -0.0052]]],
+                      [[[-0.0007, 0.00070]],
+                       [[-0.0052, 0.00370]],
+                       [[-0.0370, 0.00000]],
+                       [[-0.0052, -0.0037]],
+                       [[-0.0007, -0.0007]]]], dtype=np.float32)))
+
+    def _map_scharr_edges(self, image: torch.Tensor, magnitude: bool) -> torch.Tensor:
+        """Returns a tensor holding modified Scharr edge maps.
 
         Parameters
         ----------
-        y_true: :class:`tf.Tensor`
-            The ground truth value
-        y_pred: :class:`tf.Tensor`
-            The predicted value
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The loss value
-        """
-        true_edge = self._scharr_edges(y_true, True)
-        pred_edge = self._scharr_edges(y_pred, True)
-        ephsilon = 0.0025
-        upper = 2.0 * true_edge * pred_edge
-        lower = K.square(true_edge) + K.square(pred_edge)
-        gms = (upper + ephsilon) / (lower + ephsilon)
-        gmsd = K.std(gms, axis=(1, 2, 3), keepdims=True)
-        gmsd = K.squeeze(gmsd, axis=-1)
-        return gmsd
-
-    @classmethod
-    def _scharr_edges(cls, image: tf.Tensor, magnitude: bool) -> tf.Tensor:
-        """ Returns a tensor holding modified Scharr edge maps.
-
-        Parameters
-        ----------
-        image: :class:`tf.Tensor`
+        image
             Image tensor with shape [batch_size, h, w, d] and type float32. The image(s) must be
             2x2 or larger.
-        magnitude: bool
+        magnitude
             Boolean to determine if the edge magnitude or edge direction is returned
 
         Returns
         -------
-        :class:`tf.Tensor`
-            Tensor holding edge maps for each channel. Returns a tensor with shape `[batch_size, h,
-            w, d, 2]` where the last two dimensions hold `[[dy[0], dx[0]], [dy[1], dx[1]], ...,
-            [dy[d-1], dx[d-1]]]` calculated using the Scharr filter.
+        Tensor holding edge maps for each channel. Returns a tensor with shape `[batch_size, h, w,
+        d, 2]` where the last two dimensions hold `[[dy[0], dx[0]], [dy[1], dx[1]], ..., [dy[d-1],
+        dx[d-1]]]` calculated using the Scharr filter.
         """
-
         # Define vertical and horizontal Scharr filters.
-        static_image_shape = image.get_shape()
-        image_shape = K.shape(image)
+        bs, channels, height, width = image.shape
 
-        # 5x5 modified Scharr kernel ( reshape to (5,5,1,2) )
-        matrix = np.array([[[[0.00070, 0.00070]],
-                            [[0.00520, 0.00370]],
-                            [[0.03700, 0.00000]],
-                            [[0.00520, -0.0037]],
-                            [[0.00070, -0.0007]]],
-                           [[[0.00370, 0.00520]],
-                            [[0.11870, 0.11870]],
-                            [[0.25890, 0.00000]],
-                            [[0.11870, -0.1187]],
-                            [[0.00370, -0.0052]]],
-                           [[[0.00000, 0.03700]],
-                            [[0.00000, 0.25890]],
-                            [[0.00000, 0.00000]],
-                            [[0.00000, -0.2589]],
-                            [[0.00000, -0.0370]]],
-                           [[[-0.0037, 0.00520]],
-                            [[-0.1187, 0.11870]],
-                            [[-0.2589, 0.00000]],
-                            [[-0.1187, -0.1187]],
-                            [[-0.0037, -0.0052]]],
-                           [[[-0.0007, 0.00070]],
-                            [[-0.0052, 0.00370]],
-                            [[-0.0370, 0.00000]],
-                            [[-0.0052, -0.0037]],
-                            [[-0.0007, -0.0007]]]])
-        num_kernels = [2]
-        kernels = K.constant(matrix, dtype='float32')
-        kernels = K.tile(kernels, [1, 1, image_shape[-1], 1])
+        kernel = self._scharr_edges.repeat(1, 1, channels, 1)
+        h, w, _, depth = kernel.shape
+        kernel = kernel.permute(3, 2, 0, 1).reshape(channels * depth, 1, h, w)
 
         # Use depth-wise convolution to calculate edge maps per channel.
         # Output tensor has shape [batch_size, h, w, d * num_kernels].
-        pad_sizes = [[0, 0], [2, 2], [2, 2], [0, 0]]
-        padded = tf.pad(image,  # pylint:disable=unexpected-keyword-arg,no-value-for-parameter
-                        pad_sizes,
-                        mode='REFLECT')
-        output = K.depthwise_conv2d(padded, kernels)
+        padded = F.pad(image, (2, 2, 2, 2), mode="reflect")
+        out = F.conv2d(padded, kernel, groups=channels)  # pylint:disable=not-callable
 
         if not magnitude:  # direction of edges
             # Reshape to [batch_size, h, w, d, num_kernels].
-            shape = K.concatenate([image_shape, num_kernels], axis=0)
-            output = K.reshape(output, shape=shape)
-            output.set_shape(static_image_shape.concatenate(num_kernels))
-            output = tf.atan(K.squeeze(output[:, :, :, :, 0] / output[:, :, :, :, 1], axis=None))
+            out = out.reshape(bs, height, width, channels, 2)
+            gx = out[..., 0]
+            gy = out[..., 1]
+            out = torch.atan2(gx, gy)
         # magnitude of edges -- unified x & y edges don't work well with Neural Networks
-        return output
+        return out
 
-
-class LDRFLIPLoss():  # pylint:disable=too-few-public-methods
-    """ Computes the LDR-FLIP error map between two LDR images, assuming the images are observed
-    at a certain number of pixels per degree of visual angle.
-
-    References
-    ----------
-    https://research.nvidia.com/sites/default/files/node/3260/FLIP_Paper.pdf
-    https://github.com/NVlabs/flip
-
-    License
-    -------
-    BSD 3-Clause License
-    Copyright (c) 2020-2022, NVIDIA Corporation & AFFILIATES. All rights reserved.
-    Redistribution and use in source and binary forms, with or without modification, are permitted
-    provided that the following conditions are met:
-    Redistributions of source code must retain the above copyright notice, this list of conditions
-    and the following disclaimer.
-    Redistributions in binary form must reproduce the above copyright notice, this list of
-    conditions and the following disclaimer in the documentation and/or other materials provided
-    with the distribution.
-    Neither the name of the copyright holder nor the names of its contributors may be used to
-    endorse or promote products derived from this software without specific prior written
-    permission.
-
-    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
-    IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
-    AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
-    OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-    POSSIBILITY OF SUCH DAMAGE.
-
-    Parameters
-    ----------
-    computed_distance_exponent: float, Optional
-        The computed distance exponent to apply to Hunt adjusted, filtered colors.
-        (`qc` in original paper). Default: `0.7`
-    feature_exponent: float, Optional
-        The feature exponent to apply for increasing the impact of feature difference on the
-        final loss value. (`qf` in original paper). Default: `0.5`
-    lower_threshold_exponent: float, Optional
-        The `pc` exponent for the color pipeline as described in the original paper: Default: `0.4`
-    upper_threshold_exponent: float, Optional
-        The `pt` exponent  for the color pipeline as described in the original paper.
-        Default: `0.95`
-    epsilon: float
-        A small value to improve training stability. Default: `1e-15`
-    pixels_per_degree: float, Optional
-        The estimated number of pixels per degree of visual angle of the observer. This effectively
-        impacts the tolerance when calculating loss. The default corresponds to viewing images on a
-        0.7m wide 4K monitor at 0.7m from the display. Default: ``None``
-    color_order: str
-        The `"BGR"` or `"RGB"` color order of the incoming images
-    """
-    def __init__(self,
-                 computed_distance_exponent: float = 0.7,
-                 feature_exponent: float = 0.5,
-                 lower_threshold_exponent: float = 0.4,
-                 upper_threshold_exponent: float = 0.95,
-                 epsilon: float = 1e-15,
-                 pixels_per_degree: float | None = None,
-                 color_order: T.Literal["bgr", "rgb"] = "bgr") -> None:
-        logger.debug("Initializing: %s (computed_distance_exponent '%s', feature_exponent: %s, "
-                     "lower_threshold_exponent: %s, upper_threshold_exponent: %s, epsilon: %s, "
-                     "pixels_per_degree: %s, color_order: %s)", self.__class__.__name__,
-                     computed_distance_exponent, feature_exponent, lower_threshold_exponent,
-                     upper_threshold_exponent, epsilon, pixels_per_degree, color_order)
-
-        self._computed_distance_exponent = computed_distance_exponent
-        self._feature_exponent = feature_exponent
-        self._pc = lower_threshold_exponent
-        self._pt = upper_threshold_exponent
-        self._epsilon = epsilon
-        self._color_order = color_order.lower()
-
-        if pixels_per_degree is None:
-            pixels_per_degree = (0.7 * 3840 / 0.7) * np.pi / 180
-        self._pixels_per_degree = pixels_per_degree
-        self._spatial_filters = _SpatialFilters(pixels_per_degree)
-        self._feature_detector = _FeatureDetection(pixels_per_degree)
-        logger.debug("Initialized: %s ", self.__class__.__name__)
-
-    def __call__(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Call the LDR Flip Loss Function
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """Return the Gradient Magnitude Similarity Deviation Loss.
 
         Parameters
         ----------
-        y_true: :class:`tensorflow.Tensor`
-            The ground truth batch of images
-        y_pred: :class:`tensorflow.Tensor`
-            The predicted batch of images
+        y_true
+            The ground truth value
+        y_pred
+            The predicted value
 
         Returns
         -------
-        :class::class:`tensorflow.Tensor`
-            The calculated Flip loss value
+        The final loss value for each item in the batch
         """
-        if self._color_order == "bgr":  # Switch models training in bgr order to rgb
-            y_true = y_true[..., 2::-1]
-            y_pred = y_pred[..., 2::-1]
-
-        y_true = K.clip(y_true, 0, 1.)
-        y_pred = K.clip(y_pred, 0, 1.)
-
-        rgb2ycxcz = ColorSpaceConvert("srgb", "ycxcz")
-        true_ycxcz = rgb2ycxcz(y_true)
-        pred_ycxcz = rgb2ycxcz(y_pred)
-
-        delta_e_color = self._color_pipeline(true_ycxcz, pred_ycxcz)
-        delta_e_features = self._process_features(true_ycxcz, pred_ycxcz)
-
-        loss = K.pow(delta_e_color, 1 - delta_e_features)
+        true_edge = self._map_scharr_edges(y_true, True)
+        pred_edge = self._map_scharr_edges(y_pred, True)
+        epsilon = 0.0025
+        upper = 2.0 * true_edge * pred_edge
+        lower = torch.square(true_edge) + torch.square(pred_edge)
+        gms = (upper + epsilon) / (lower + epsilon)
+        if self._spatial:
+            # per-pixel similarity reasonable proxy for spatial loss
+            loss = 1.0 - gms.mean(dim=1)[:, None]
+        else:
+            loss = torch.std(gms, dim=(1, 2, 3))
         return loss
 
-    def _color_pipeline(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Perform the color processing part of the FLIP loss function
 
-        Parameters
-        ----------
-        y_true: :class:`tensorflow.Tensor`
-            The ground truth batch of images in YCxCz color space
-        y_pred: :class:`tensorflow.Tensor`
-            The predicted batch of images in YCxCz color space
-
-        Returns
-        -------
-        :class:`tensorflow.Tensor`
-            The exponentiated, maximum HyAB difference between two colors in Hunt-adjusted
-            L*A*B* space
-        """
-        filtered_true = self._spatial_filters(y_true)
-        filtered_pred = self._spatial_filters(y_pred)
-
-        rgb2lab = ColorSpaceConvert(from_space="rgb", to_space="lab")
-        preprocessed_true = self._hunt_adjustment(rgb2lab(filtered_true))
-        preprocessed_pred = self._hunt_adjustment(rgb2lab(filtered_pred))
-        hunt_adjusted_green = self._hunt_adjustment(rgb2lab(K.constant([[[[0.0, 1.0, 0.0]]]],
-                                                                       dtype="float32")))
-        hunt_adjusted_blue = self._hunt_adjustment(rgb2lab(K.constant([[[[0.0, 0.0, 1.0]]]],
-                                                                      dtype="float32")))
-
-        delta = self._hyab(preprocessed_true, preprocessed_pred)
-        power_delta = K.pow(delta, self._computed_distance_exponent)
-        cmax = K.pow(self._hyab(hunt_adjusted_green, hunt_adjusted_blue),
-                     self._computed_distance_exponent)
-        return self._redistribute_errors(power_delta, cmax)
-
-    def _process_features(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Perform the color processing part of the FLIP loss function
-
-        Parameters
-        ----------
-        y_true: :class:`tensorflow.Tensor`
-            The ground truth batch of images in YCxCz color space
-        y_pred: :class:`tensorflow.Tensor`
-            The predicted batch of images in YCxCz color space
-
-        Returns
-        -------
-        :class:`tensorflow.Tensor`
-            The exponentiated features delta
-        """
-        col_y_true = (y_true[..., 0:1] + 16) / 116.
-        col_y_pred = (y_pred[..., 0:1] + 16) / 116.
-
-        edges_true = self._feature_detector(col_y_true, "edge")
-        points_true = self._feature_detector(col_y_true, "point")
-        edges_pred = self._feature_detector(col_y_pred, "edge")
-        points_pred = self._feature_detector(col_y_pred, "point")
-
-        delta = K.maximum(K.abs(frobenius_norm(edges_true) - frobenius_norm(edges_pred)),
-                          K.abs(frobenius_norm(points_pred) - frobenius_norm(points_true)))
-
-        delta = K.clip(delta, min_value=self._epsilon, max_value=None)
-        return K.pow(((1 / np.sqrt(2)) * delta), self._feature_exponent)
-
-    @classmethod
-    def _hunt_adjustment(cls, image: tf.Tensor) -> tf.Tensor:
-        """ Apply Hunt-adjustment to an image in L*a*b* color space
-
-        Parameters
-        ----------
-        image: :class:`tensorflow.Tensor`
-            The batch of images in L*a*b* to adjust
-
-        Returns
-        -------
-        :class:`tensorflow.Tensor`
-            The hunt adjusted batch of images in L*a*b color space
-        """
-        ch_l = image[..., 0:1]
-        adjusted = K.concatenate([ch_l, image[..., 1:] * (ch_l * 0.01)], axis=-1)
-        return adjusted
-
-    def _hyab(self, y_true, y_pred):
-        """ Compute the HyAB distance between true and predicted images.
-
-        Parameters
-        ----------
-        y_true: :class:`tensorflow.Tensor`
-            The ground truth batch of images in standard or Hunt-adjusted L*A*B* color space
-        y_pred: :class:`tensorflow.Tensor`
-            The predicted batch of images in in standard or Hunt-adjusted L*A*B* color space
-
-        Returns
-        -------
-        :class:`tensorflow.Tensor`
-            image tensor containing the per-pixel HyAB distances between true and predicted images
-        """
-        delta = y_true - y_pred
-        root = K.sqrt(K.clip(K.pow(delta[..., 0:1], 2), min_value=self._epsilon, max_value=None))
-        delta_norm = frobenius_norm(delta[..., 1:3])
-        return root + delta_norm
-
-    def _redistribute_errors(self, power_delta_e_hyab, cmax):
-        """ Redistribute exponentiated HyAB errors to the [0,1] range
-
-        Parameters
-        ----------
-        power_delta_e_hyab: :class:`tensorflow.Tensor`
-            The exponentiated HyAb distance
-        cmax: :class:`tensorflow.Tensor`
-            The exponentiated, maximum HyAB difference between two colors in Hunt-adjusted
-            L*A*B* space
-
-        Returns
-        -------
-        :class:`tensorflow.Tensor`
-            The redistributed per-pixel HyAB distances (in range [0,1])
-        """
-        pccmax = self._pc * cmax
-        delta_e_c = K.switch(
-            power_delta_e_hyab < pccmax,
-            (self._pt / pccmax) * power_delta_e_hyab,
-            self._pt + ((power_delta_e_hyab - pccmax) / (cmax - pccmax)) * (1.0 - self._pt))
-        return delta_e_c
-
-
-class _SpatialFilters():  # pylint:disable=too-few-public-methods
-    """ Filters an image with channel specific spatial contrast sensitivity functions and clips
-    result to the unit cube in linear RGB.
-
-    For use with LDRFlipLoss.
+class _SSIM(nn.Module):  # pylint:disable=abstract-method
+    """Parent class for SSIM and MSSIM loss functions
 
     Parameters
     ----------
-    pixels_per_degree: float
-        The estimated number of pixels per degree of visual angle of the observer. This effectively
-        impacts the tolerance when calculating loss.
+    max_val
+        The dynamic range of the images (i.e., the difference between the maximum the and minimum
+        allowed values). Default `1.0` (0.0 - 1.0)
+    filter_size
+        Size of gaussian filter. Default: `11`
+    filter_sigma:
+        Width of gaussian filter. Default: 1.5
+    k1
+        The K1 value. Default: `0.01`
+    k2
+        The K2 value. Default: `0.03` (SSIM is less sensitivity to K2 for lower values, so
+        it would be better if we took the values in the range of 0 < K2 < 0.4).
+    spatial_output
+        ``True`` to output the loss values spatially. ``False`` as scalar per item.
+        Default: ``True``
+
+    Reference
+    ---------
+    https://github.com/tensorflow/tensorflow/blob/v2.16.1/tensorflow/python/ops/image_ops_impl.py
     """
-    def __init__(self, pixels_per_degree: float) -> None:
-        self._pixels_per_degree = pixels_per_degree
-        self._spatial_filters, self._radius = self._generate_spatial_filters()
-        self._ycxcz2rgb = ColorSpaceConvert(from_space="ycxcz", to_space="rgb")
+    _kernel: torch.Tensor
 
-    def _generate_spatial_filters(self) -> tuple[tf.Tensor, int]:
-        """ Generates spatial contrast sensitivity filters with width depending on the number of
-        pixels per degree of visual angle of the observer for channels "A", "RG" and "BY"
+    def __init__(self,
+                 max_val: float = 1.0,
+                 filter_size: int = 11,
+                 filter_sigma: float = 1.5,
+                 k1: float = 0.01,
+                 k2: float = 0.03,
+                 spatial_output: bool = True) -> None:
+        super().__init__()
+        self._max_value = max_val
+        self._filter_sigma = filter_sigma
+        self._k1 = k1
+        self._k2 = k2
+        self._spatial = spatial_output
+        self.register_buffer("_kernel", self._fspecial_gauss(filter_size, filter_sigma))
 
-        Returns
-        -------
-        dict
-            the channels ("A" (Achromatic CSF), "RG" (Red-Green CSF) or "BY" (Blue-Yellow CSF)) as
-            key with the Filter kernel corresponding to the spatial contrast sensitivity function
-            of channel and kernel's radius
-        """
-        mapping = {"A": {"a1": 1, "b1": 0.0047, "a2": 0, "b2": 1e-5},
-                   "RG": {"a1": 1, "b1": 0.0053, "a2": 0, "b2": 1e-5},
-                   "BY": {"a1": 34.1, "b1": 0.04, "a2": 13.5, "b2": 0.025}}
-
-        domain, radius = self._get_evaluation_domain(mapping["A"]["b1"],
-                                                     mapping["A"]["b2"],
-                                                     mapping["RG"]["b1"],
-                                                     mapping["RG"]["b2"],
-                                                     mapping["BY"]["b1"],
-                                                     mapping["BY"]["b2"])
-
-        weights = np.array([self._generate_weights(mapping[channel], domain)
-                            for channel in ("A", "RG", "BY")])
-        weights = K.constant(np.moveaxis(weights, 0, -1), dtype="float32")
-
-        return weights, radius
-
-    def _get_evaluation_domain(self,
-                               b1_a: float,
-                               b2_a: float,
-                               b1_rg: float,
-                               b2_rg: float,
-                               b1_by: float,
-                               b2_by: float) -> tuple[np.ndarray, int]:
-        """ TODO docstring """
-        max_scale_parameter = max([b1_a, b2_a, b1_rg, b2_rg, b1_by, b2_by])
-        delta_x = 1.0 / self._pixels_per_degree
-        radius = int(np.ceil(3 * np.sqrt(max_scale_parameter / (2 * np.pi**2))
-                             * self._pixels_per_degree))
-        ax_x, ax_y = np.meshgrid(range(-radius, radius + 1), range(-radius, radius + 1))
-        domain = (ax_x * delta_x) ** 2 + (ax_y * delta_x) ** 2
-        return domain, radius
-
-    @classmethod
-    def _generate_weights(cls, channel: dict[str, float], domain: np.ndarray) -> tf.Tensor:
-        """ TODO docstring """
-        a_1, b_1, a_2, b_2 = channel["a1"], channel["b1"], channel["a2"], channel["b2"]
-        grad = (a_1 * np.sqrt(np.pi / b_1) * np.exp(-np.pi ** 2 * domain / b_1) +
-                a_2 * np.sqrt(np.pi / b_2) * np.exp(-np.pi ** 2 * domain / b_2))
-        grad = grad / np.sum(grad)
-        grad = np.reshape(grad, (*grad.shape, 1))
-        return grad
-
-    def __call__(self, image: tf.Tensor) -> tf.Tensor:
-        """ Call the spacial filtering.
+    def _fspecial_gauss(self, size: int, sigma: float) -> torch.Tensor:
+        """Function to mimic the 'fspecial' gaussian MATLAB function.
 
         Parameters
         ----------
-        image: Tensor
-            Image tensor to filter in YCxCz color space
+        filter_size
+            size of gaussian filter
+        sigma
+            width of gaussian filter
 
         Returns
         -------
-        Tensor
-            The input image transformed to linear RGB after filtering with spatial contrast
-            sensitivity functions
+        The gaussian kernel in channels first depthwise format (1,1,H,W)
         """
-        padded_image = replicate_pad(image, self._radius)
-        image_tilde_opponent = K.conv2d(padded_image,
-                                        self._spatial_filters,
-                                        strides=1,
-                                        padding="valid")
-        rgb = K.clip(self._ycxcz2rgb(image_tilde_opponent), 0., 1.)
-        return rgb
+        coords = torch.arange(0, size, dtype=torch.float32)
+        coords -= (size - 1) / 2.
+
+        gauss = coords ** 2
+        gauss *= (-0.5 / (sigma ** 2))
+
+        gauss = gauss.reshape(1, -1) + gauss.reshape(-1, 1)
+        gauss = gauss.reshape(1, -1)  # For ops.softmax().
+        gauss = F.softmax(gauss, dim=-1)
+        return gauss.reshape(1, 1, size, size)
+
+    def _reducer(self, image: torch.Tensor) -> torch.Tensor:
+        """Computes local averages from a set of images
+
+        Parameters
+        ----------
+        image
+            The images to be processed (N,C,H,W)
+
+        Returns
+        -------
+        The reduced image
+        """
+        shape = image.shape
+        channels = shape[-3]
+        kernel = self._kernel.repeat(channels, 1, 1, 1)
+        x = image.reshape(-1, *shape[-3:])
+        pad = self._kernel.shape[-1] // 2
+        if self._spatial:
+            x = F.pad(x, [pad, pad, pad, pad], mode="reflect")  # preserve spatial dims
+        y = F.conv2d(x, kernel, groups=channels)  # pylint:disable=not-callable
+        return y.reshape((*shape[:-3], *y.shape[1:]))
+
+    def _ssim_helper(self,
+                     image1: torch.Tensor,
+                     image2: torch.Tensor,
+                     compensation: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Helper function for computing SSIM
+
+        Parameters
+        ----------
+        image1
+            The first set of images (N,C,H,W)
+        image2
+            The second set of images (N,C,H,W)
+        compensation
+            Compensation factor. Default: `1.0`
+
+        Returns
+        -------
+        ssim
+            The channel-wise SSIM
+        contrast
+            The channel-wise contrast-structure
+        """
+        c_1 = (self._k1 * self._max_value) ** 2
+        c_2 = (self._k2 * self._max_value) ** 2
+
+        mean0 = self._reducer(image1)
+        mean1 = self._reducer(image2)
+
+        num0 = mean0 * mean1 * 2.0
+        den0 = mean0 ** 2 + mean1 ** 2
+        luminance = (num0 + c_1) / (den0 + c_1)
+
+        num1 = self._reducer(image1 * image2) * 2.0
+        den1 = self._reducer(image1 ** 2 + image2 ** 2)
+
+        c_2 *= compensation
+        cs_ = (num1 - num0 + c_2) / ((den1 - den0).clamp(min=0) + c_2)
+
+        return luminance, cs_
+
+    def _ssim_per_channel(self,
+                          image1: torch.Tensor,
+                          image2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Computes SSIM index between image1 and image2 per color channel.
+
+        This function matches the standard SSIM implementation from:
+        Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). Image
+        quality assessment: from error visibility to structural similarity. IEEE
+        transactions on image processing.
+
+        Parameters
+        ----------
+        image1
+            The first image batch (N,C,H,W)
+        image2
+            The second image batch. (N,C,H,W)
+        filter_size
+            size of gaussian filter.
+
+        Returns
+        -------
+        ssim
+            The channel-wise SSIM
+        contrast
+            The channel-wise contrast-structure
+        """
+        luminance, cs_ = self._ssim_helper(image1, image2)
+        ssim_val = luminance * cs_
+        if not self._spatial:  # Average over height, width.
+            ssim_val = ssim_val.mean(dim=(-2, -1))
+            cs_ = cs_.mean(dim=(-2, -1))
+        return ssim_val, cs_
 
 
-class _FeatureDetection():  # pylint:disable=too-few-public-methods
-    """ Detect features (i.e. edges and points) in an achromatic YCxCz image.
+class SSIMLoss(_SSIM):
+    """Computes SSIM index between img1 and img2.
 
-    For use with LDRFlipLoss.
+    This function is based on the standard SSIM implementation from:
+    Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). Image
+    quality assessment: from error visibility to structural similarity. IEEE
+    transactions on image processing.
 
-    Parameters
-    ----------
-    pixels_per_degree: float
-        The number of pixels per degree of visual angle of the observer
+    Note: The true SSIM is only defined on grayscale.  This function does not
+    perform any color-space transform.  (If the input is already YUV, then it will
+    compute YUV SSIM average.)
+
+    Details:
+        - 11x11 Gaussian filter of width 1.5 is used.
+        - k1 = 0.01, k2 = 0.03 as in the original paper.
+
+    The filter is reduced in size of the image is smaller than 11x11.
+
+    Reference
+    ---------
+    https://github.com/tensorflow/tensorflow/blob/v2.16.1/tensorflow/python/ops/image_ops_impl.py
     """
-    def __init__(self, pixels_per_degree: float) -> None:
-        width = 0.082
-        self._std = 0.5 * width * pixels_per_degree
-        self._radius = int(np.ceil(3 * self._std))
-        self._grid = np.meshgrid(range(-self._radius, self._radius + 1),
-                                 range(-self._radius, self._radius + 1))
-        self._gradient = np.exp(-(self._grid[0] ** 2 + self._grid[1] ** 2)
-                                / (2 * (self._std ** 2)))
 
-    def __call__(self, image: tf.Tensor, feature_type: str) -> tf.Tensor:
-        """ Run the feature detection
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """Call the SSIM Loss Function.
 
         Parameters
         ----------
-        image: Tensor
-            Batch of images in YCxCz color space with normalized Y values
-        feature_type: str
-            Type of features to detect (`"edge"` or `"point"`)
+        y_true
+            The input batch of ground truth images
+        y_pred
+            The input batch of predicted images
 
         Returns
         -------
-        Tensor
-            Detected features in the 0-1 range
+        The final SSIM for each item in the batch
         """
-        feature_type = feature_type.lower()
-
-        if feature_type == 'edge':
-            grad_x = np.multiply(-self._grid[0], self._gradient)
-        else:
-            grad_x = np.multiply(self._grid[0] ** 2 / (self._std ** 2) - 1, self._gradient)
-
-        negative_weights_sum = -np.sum(grad_x[grad_x < 0])
-        positive_weights_sum = np.sum(grad_x[grad_x > 0])
-
-        grad_x = K.constant(grad_x)
-        grad_x = K.switch(grad_x < 0, grad_x / negative_weights_sum, grad_x / positive_weights_sum)
-        kernel = K.expand_dims(K.expand_dims(grad_x, axis=-1), axis=-1)
-
-        features_x = K.conv2d(replicate_pad(image, self._radius),
-                              kernel,
-                              strides=1,
-                              padding="valid")
-        kernel = K.permute_dimensions(kernel, (1, 0, 2, 3))
-        features_y = K.conv2d(replicate_pad(image, self._radius),
-                              kernel,
-                              strides=1,
-                              padding="valid")
-        features = K.concatenate([features_x, features_y], axis=-1)
-        return features
+        ssim_per_channel, _ = self._ssim_per_channel(y_true, y_pred)
+        loss = 1.0 - ssim_per_channel
+        if not self._spatial:
+            loss = loss.mean(dim=-1)
+        return loss
 
 
-class MSSIMLoss():  # pylint:disable=too-few-public-methods
-    """ Multiscale Structural Similarity Loss Function
+class MSSIMLoss(_SSIM):
+    """Computes the MS-SSIM between img1 and img2.
+
+    This function assumes that `img1` and `img2` are image batches, i.e. the last
+    three dimensions are [height, width, channels].
+
+    Note: The true SSIM is only defined on grayscale.  This function does not
+    perform any color-space transform.  (If the input is already YUV, then it will
+    compute YUV SSIM average.)
+
+    Original paper: Wang, Zhou, Eero P. Simoncelli, and Alan C. Bovik. "Multiscale
+    structural similarity for image quality assessment." Signals, Systems and
+    Computers, 2004.
+
+    Details:
+        - 11x11 Gaussian filter of width 1.5 is used.
+        - k1 = 0.01, k2 = 0.03 as in the original paper.
+
+    The filter is reduced in size if the smallest image is smaller than 11x11.
 
     Parameters
     ----------
-    k_1: float, optional
-        Parameter of the SSIM. Default: `0.01`
-    k_2: float, optional
-        Parameter of the SSIM. Default: `0.03`
-    filter_size: int, optional
-        size of gaussian filter Default: `11`
-    filter_sigma: float, optional
-        Width of gaussian filter Default: `1.5`
-    max_value: float, optional
-        Max value of the output. Default: `1.0`
-    power_factors: tuple, optional
+    max_val
+        The dynamic range of the images (i.e., the difference between the maximum the and minimum
+        allowed values). Default `1.0` (0.0 - 1.0)
+    filter_size
+        Size of gaussian filter. Default: `11`
+    filter_sigma:
+        Width of gaussian filter. Default: 1.5
+    k1
+        The K1 value. Default: `0.01`
+    k2
+        The K2 value. Default: `0.03` (SSIM is less sensitivity to K2 for lower values, so
+        it would be better if we took the values in the range of 0 < K2 < 0.4).
+    spatial_output
+        ``True`` to output the loss values spatially. ``False`` as scalar per item.
+        Default: ``True``
+    power_factors
         Iterable of weights for each of the scales. The number of scales used is the length of the
         list. Index 0 is the unscaled resolution's weight and each increasing scale corresponds to
         the image being downsampled by 2. Defaults to the values obtained in the original paper.
         Default: (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
 
-    Notes
-    ------
-    You should add a regularization term like a l2 loss in addition to this one.
+    Reference
+    ---------
+    https://github.com/tensorflow/tensorflow/blob/v2.16.1/tensorflow/python/ops/image_ops_impl.py
     """
+    _power_factors: torch.Tensor
+    _divisor_tensor: torch.Tensor
+
     def __init__(self,
-                 k_1: float = 0.01,
-                 k_2: float = 0.03,
+                 max_val: float = 1.0,
                  filter_size: int = 11,
                  filter_sigma: float = 1.5,
-                 max_value: float = 1.0,
+                 k1: float = 0.01,
+                 k2: float = 0.03,
+                 spatial_output: bool = True,
                  power_factors: tuple[float, ...] = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
                  ) -> None:
-        self.filter_size = filter_size
-        self.filter_sigma = filter_sigma
-        self.k_1 = k_1
-        self.k_2 = k_2
-        self.max_value = max_value
-        self.power_factors = power_factors
-
-    def __call__(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        """ Call the MS-SSIM Loss Function.
-
-        Parameters
-        ----------
-        y_true: :class:`tf.Tensor`
-            The ground truth value
-        y_pred: :class:`tf.Tensor`
-            The predicted value
-
-        Returns
-        -------
-        :class:`tf.Tensor`
-            The MS-SSIM Loss value
-        """
-        im_size = K.int_shape(y_true)[1]
-        # filter size cannot be larger than the smallest scale
-        smallest_scale = self._get_smallest_size(im_size, len(self.power_factors) - 1)
-        filter_size = min(self.filter_size, smallest_scale)
-
-        ms_ssim = tf.image.ssim_multiscale(y_true,
-                                           y_pred,
-                                           self.max_value,
-                                           power_factors=self.power_factors,
-                                           filter_size=filter_size,
-                                           filter_sigma=self.filter_sigma,
-                                           k1=self.k_1,
-                                           k2=self.k_2)
-        ms_ssim_loss = 1. - ms_ssim
-        return K.mean(ms_ssim_loss)
+        super().__init__(max_val, filter_size, filter_sigma, k1, k2, spatial_output)
+        self._divisor = [1, 1, 2, 2]
+        self.register_buffer("_power_factors", torch.Tensor(power_factors).float())
+        self.register_buffer("_divisor_tensor", torch.Tensor(self._divisor[1:]).int())
+        self._validated = False
 
     def _get_smallest_size(self, size: int, idx: int) -> int:
-        """ Recursive function to obtain the smallest size that the image will be scaled to.
+        """Recursive function to obtain the smallest size that the image will be scaled to.
 
         Parameters
         ----------
@@ -744,7 +420,138 @@ class MSSIMLoss():  # pylint:disable=too-few-public-methods
             The smallest size the image will be scaled to based on the original image size and
             the amount of scaling factors that will occur
         """
-        logger.debug("scale id: %s, size: %s", idx, size)
+        logger.trace("[MSSIM] scale id: %s, size: %s", idx, size)  # type:ignore[attr-defined]
         if idx > 0:
             size = self._get_smallest_size(size // 2, idx - 1)
         return size
+
+    def _validate_kernel(self, image: torch.Tensor) -> None:
+        """Validate that the kernel is an appropriate size for the smallest scale image. If not,
+        create a new kernel and show warning. Validation is run once on first batch of images seen
+
+        Parameters
+        ----------
+        image
+            A batch of incoming images to perform size validation on
+        """
+        if self._validated:
+            return
+        im_size = image.shape[2]
+        smallest_scale = self._get_smallest_size(im_size, len(self._power_factors) - 1)
+        kernel_size = self._kernel.shape[-1]
+
+        if smallest_scale >= kernel_size:
+            logger.info("[MSSIM] Inbound images are valid. smallest_scale: %s, kernel_size: %s",
+                        smallest_scale, kernel_size)
+            self._validated = True
+            return
+
+        logger.warning("[MSSIM] Output size %spx is below 176px. The MS-SSIM kernel must be "
+                       "adjusted to accommodate. You will likely get better results using SSIM.",
+                       im_size)
+        del self._kernel
+        flt = smallest_scale - 1 if smallest_scale % 2 == 0 else smallest_scale
+        if flt < 3:
+            raise FaceswapError("The output size of the selected model is too small for MS-SSIM. "
+                                "Use SSIM instead.")
+        logger.debug("[MSSIM] Adjusting filter kernel to %s from %s for smallest scale %s.",
+                     flt, kernel_size, smallest_scale)
+        self._kernel = self._fspecial_gauss(flt, self._filter_sigma).to(image.device)
+        self._validated = True
+
+    @classmethod
+    def _do_pad(cls, images: list[torch.Tensor], remainder: torch.Tensor) -> list[torch.Tensor]:
+        """Pad images
+
+        Parameters
+        ----------
+        images
+            Images to pad (N,C,H,W)
+        remainder
+            Remaining images to pad (C,H,W)
+
+        Returns
+        -------
+        Padded images (N,C,H,W)
+        """
+        height = int(remainder[1])
+        width = int(remainder[2])
+        return [F.pad(x, (0, width, 0, height), mode="replicate") for x in images]
+
+    def _mssism(self,  # pylint:disable=too-many-locals
+                y_true: torch.Tensor,
+                y_pred: torch.Tensor) -> torch.Tensor:
+        """Perform the MSSISM calculation.
+
+        Ported from Tensorflow implementation `image.ssim_multiscale`
+
+        Parameters
+        ----------
+        y_true
+            The ground truth value
+        y_pred
+            The predicted value
+        """
+        images = [y_true, y_pred]
+        shapes = [y_true.shape, y_pred.shape]
+        heads = [s[:-3] for s in shapes]  # Batch dimensions
+        tails = [s[-3:] for s in shapes]  # Image dimensions
+        mcs = []
+        ssim_per_channel = None
+        size = y_true.shape[-1]
+        for k in range(len(self._power_factors)):
+            if k > 0:
+                # Avg pool takes rank 4 tensors. Flatten leading dimensions.
+                flat_images = [(x.reshape(-1, *t)) for x, t in zip(images, tails)]
+                remainder = torch.tensor(tails[0], device=y_pred.device) % self._divisor_tensor
+                if (remainder != 0).any():
+                    flat_images = self._do_pad(flat_images, remainder)
+
+                downscaled = [F.avg_pool2d(x,  # pylint:disable=not-callable
+                                           self._divisor[2:],
+                                           stride=self._divisor[2:],
+                                           padding=0)
+                              for x in flat_images]
+                tails = [x.shape[1:] for x in downscaled]
+                images = [x.reshape(*h, *t) for x, h, t in zip(downscaled, heads, tails)]
+
+            # Overwrite previous ssim value since we only need the last one.
+            ssim_per_channel, cs_ = self._ssim_per_channel(images[0], images[1])
+            if self._spatial:
+                cs_ = F.interpolate(cs_, size=size, mode="bilinear", align_corners=False)
+            mcs.append(F.relu(cs_))
+
+        mcs.pop()  # Remove the cs score for the last scale.
+        assert ssim_per_channel is not None
+        if self._spatial:
+            ssim_per_channel = F.interpolate(ssim_per_channel,
+                                             size=size,
+                                             mode="bilinear",
+                                             align_corners=False)
+        mcs_and_ssim = torch.stack(mcs + [F.relu(ssim_per_channel)], dim=-1)
+        ms_ssim = torch.prod(mcs_and_ssim ** self._power_factors, dim=-1)
+        if not self._spatial:
+            ms_ssim = ms_ssim.mean(dim=-1)  # Avg over color channels.
+        return ms_ssim
+
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """Call the MS-SSIM Loss Function.
+
+        Parameters
+        ----------
+        y_true
+            The ground truth value
+        y_pred
+            The predicted value
+
+        Returns
+        -------
+        The MS-SSIM Loss value
+        """
+        self._validate_kernel(y_true)
+        ms_ssim = self._mssism(y_true, y_pred)
+        ms_ssim_loss = 1. - ms_ssim
+        return ms_ssim_loss
+
+
+__all__ = get_module_objects(__name__)

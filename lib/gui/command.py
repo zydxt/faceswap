@@ -6,6 +6,8 @@ import gettext
 import tkinter as tk
 from tkinter import ttk
 
+from lib.utils import get_module_objects
+
 from .control_helper import ControlPanel
 from .custom_widgets import Tooltip
 from .utils import get_images, get_config
@@ -130,7 +132,7 @@ class CommandTab(ttk.Frame):  # pylint:disable=too-many-ancestors
         """ Build the tab """
         logger.debug("Build Tab: '%s'", self.command)
         options = get_config().cli_opts.opts[self.command]
-        cp_opts = [val.cpanel_option for val in options.values() if isinstance(val, CliOption)]
+        cp_opts = [val.panel_option for val in options.values() if isinstance(val, CliOption)]
         ControlPanel(self,
                      cp_opts,
                      label_width=16,
@@ -144,10 +146,10 @@ class CommandTab(ttk.Frame):  # pylint:disable=too-many-ancestors
 
     def add_frame_separator(self):
         """ Add a separator between top and bottom frames """
-        logger.debug("Add frame seperator")
+        logger.debug("Add frame separator")
         sep = ttk.Frame(self, height=2, relief=tk.RIDGE)
         sep.pack(fill=tk.X, pady=(5, 0), side=tk.TOP)
-        logger.debug("Added frame seperator")
+        logger.debug("Added frame separator")
 
 
 class ActionFrame(ttk.Frame):  # pylint:disable=too-many-ancestors
@@ -198,3 +200,6 @@ class ActionFrame(ttk.Frame):  # pylint:disable=too-many-ancestors
         actionbtns[self.command] = btnact
 
         logger.debug("Added action buttons: '%s'", self.title)
+
+
+__all__ = get_module_objects(__name__)

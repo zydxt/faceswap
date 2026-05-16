@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-""" Command Line Arguments for tools """
-import argparse
+"""Command Line Arguments for tools"""
 import gettext
 
 from lib.cli.args import FaceSwapArgs
 from lib.cli.actions import (DirOrFileFullPaths, DirFullPaths, FileFullPaths, Radio, Slider)
+from lib.utils import get_module_objects
 from plugins.plugin_loader import PluginLoader
 
 
+# pylint:disable=duplicate-code
 # LOCALES
 _LANG = gettext.translation("tools.mask.cli", localedir="locales", fallback=True)
 _ = _LANG.gettext
@@ -58,7 +59,7 @@ class MaskArgs(FaceSwapArgs):
             "group": _("data"),
             "default": "frames",
             "help": _(
-                "R|Whether the `input` is a folder of faces or a folder frames/video"
+                "R|Whether the `input` is a folder of faces/frames or a video file"
                 "\nL|faces: The input is a folder containing extracted faces."
                 "\nL|frames: The input is a folder containing frames or is a video")})
         argument_list.append({
@@ -83,23 +84,17 @@ class MaskArgs(FaceSwapArgs):
             "action": Radio,
             "type": str.lower,
             "choices": PluginLoader.get_available_extractors("mask"),
-            "default": "extended",
+            "default": "bisenet-fp",
             "group": _("process"),
             "help": _(
                 "R|Masker to use."
                 "\nL|bisenet-fp: Relatively lightweight NN based mask that provides more "
                 "refined control over the area to be masked including full head masking "
                 "(configurable in mask settings)."
-                "\nL|components: Mask designed to provide facial segmentation based on the "
-                "positioning of landmark locations. A convex hull is constructed around the "
-                "exterior of the landmarks to create a mask."
                 "\nL|custom: A dummy mask that fills the mask area with all 1s or 0s "
                 "(configurable in settings). This is only required if you intend to manually "
                 "edit the custom masks yourself in the manual tool. This mask does not use the "
                 "GPU."
-                "\nL|extended: Mask designed to provide facial segmentation based on the "
-                "positioning of landmark locations. A convex hull is constructed around the "
-                "exterior of the landmarks and the mask is extended upwards onto the forehead."
                 "\nL|vgg-clear: Mask designed to provide smart segmentation of mostly frontal "
                 "faces clear of obstructions. Profile faces and obstructions may result in "
                 "sub-par performance."
@@ -236,10 +231,7 @@ class MaskArgs(FaceSwapArgs):
             "help": _(
                 "R|Whether to output the whole frame or only the face box when using "
                 "output processing. Only has an effect when using frames as input.")})
-        # Deprecated multi-character switches
-        argument_list.append({
-            "opts": ("-it", ),
-            "type": str,
-            "dest": "depr_input-type_it_I",
-            "help": argparse.SUPPRESS})
         return argument_list
+
+
+__all__ = get_module_objects(__name__)

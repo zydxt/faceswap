@@ -1,57 +1,61 @@
-****************
-training package
-****************
+*********************
+lib.training package
+*********************
 
-The training Package handles the processing of faces for feeding into a Faceswap model.
+The training Package handles libraries to assist with training a model
 
 .. contents:: Contents
    :local:
+   :depth: 2
 
-training.augmentation module
-============================
+.. automodapi:: lib.training.loss
+   :include-all-objects:
 
-.. automodule:: lib.training.augmentation
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+.. automodapi:: lib.training.lr_finder
+   :include-all-objects:
 
-training.cache module
-=====================
+|
+.. automodapi:: lib.training.lr_warmup
+   :include-all-objects:
+   :no-inheritance-diagram:
 
-.. automodule:: lib.training.cache
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+.. automodapi:: lib.training.preview
+   :include-all-objects:
+   :no-inheritance-diagram:
 
+|
+.. automodapi:: lib.training.preview_cv
+   :include-all-objects:
 
-training.generator module
-=========================
+|
+.. automodapi:: lib.training.preview_tk
+   :include-all-objects:
 
-.. automodule:: lib.training.generator
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+.. automodapi:: lib.training.tensorboard
+   :include-all-objects:
 
-training.lr_finder module
-=========================
+|
+.. automodapi:: lib.training.train
+   :include-all-objects:
 
-.. automodule:: lib.training.lr_finder
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+data package
+============
 
-training.preview_cv module
-==========================
+.. automodapi:: lib.training.data.augmentation
+   :include-all-objects:
 
-.. automodule:: lib.training.preview_cv
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+.. automodapi:: lib.training.data.collate
+   :include-all-objects:
 
-training.preview_tk module
-==========================
+|
+.. automodapi:: lib.training.data.data_set
+   :include-all-objects:
 
-.. automodule:: lib.training.preview_tk
-   :members:
-   :undoc-members:
-   :show-inheritance:
+|
+.. automodapi:: lib.training.data.loader
+   :include-all-objects:

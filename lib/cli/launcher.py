@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" Launches the correct script with the given Command Line Arguments """
+"""Launches the correct script with the given Command Line Arguments"""
 from __future__ import annotations
 import logging
 import os
@@ -9,10 +9,10 @@ import typing as T
 
 from importlib import import_module
 
-from lib.gpu_stats import set_exclude_devices, GPUStats
+from lib.gpu_stats import GPUStats
 from lib.logger import crash_log, log_setup
-from lib.utils import (FaceswapError, get_backend, get_tf_version,
-                       safe_shutdown, set_backend, set_system_verbosity)
+from lib.utils import (FaceswapError, get_backend, get_torch_version,
+                       get_module_objects, safe_shutdown, set_backend)
 
 if T.TYPE_CHECKING:
     import argparse
@@ -22,30 +22,45 @@ logger = logging.getLogger(__name__)
 
 
 class ScriptExecutor():
-    """ Loads the relevant script modules and executes the script.
+    """Loads the relevant script modules and executes the script.
 
-        This class is initialized in each of the argparsers for the relevant
-        command, then execute script is called within their set_default
-        function.
+    This class is initialized in each of the arg parsers for the relevant command, then execute
+    script is called within their set_default function.
 
-        Parameters
-        ----------
-        command: str
-            The faceswap command that is being executed
-        """
+    Parameters
+    ----------
+    command
+        The faceswap command that is being executed
+    """
     def __init__(self, command: str) -> None:
         self._command = command.lower()
 
+    def _set_environment_variables(self) -> None:
+        """Set the number of threads that numexpr can use. """
+        # Allocate a decent number of threads to numexpr to suppress warnings
+        cpu_count = os.cpu_count()
+        allocate = max(1, cpu_count - cpu_count // 3 if cpu_count is not None else 1)
+        if "OMP_NUM_THREADS" in os.environ:
+            # If this is set above NUMEXPR_MAX_THREADS, numexpr will error.
+            # ref: https://github.com/pydata/numexpr/issues/322
+            os.environ.pop("OMP_NUM_THREADS")
+        logger.debug("Setting NUMEXPR_MAX_THREADS to %s", allocate)
+        os.environ["NUMEXPR_MAX_THREADS"] = str(allocate)
+        os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+        if get_backend() == "apple_silicon":  # Let apple put unsupported ops on the CPU
+            logger.debug("Enabling unsupported Ops on CPU for Apple Silicon")
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
     def _import_script(self) -> Callable:
-        """ Imports the relevant script as indicated by :attr:`_command` from the scripts folder.
+        """Imports the relevant script as indicated by :attr:`_command` from the scripts folder.
 
         Returns
         -------
-        class: Faceswap Script
-            The uninitialized script from the faceswap scripts folder.
+        The uninitialized script from the faceswap scripts folder.
         """
         self._set_environment_variables()
-        self._test_for_tf_version()
+        self._test_for_torch_version()
         self._test_for_gui()
         cmd = os.path.basename(sys.argv[0])
         src = f"tools.{self._command.lower()}" if cmd == "tools.py" else "scripts"
@@ -54,91 +69,43 @@ class ScriptExecutor():
         script = getattr(module, self._command.title())
         return script
 
-    def _set_environment_variables(self) -> None:
-        """ Set the number of threads that numexpr can use and TF environment variables. """
-        # Allocate a decent number of threads to numexpr to suppress warnings
-        cpu_count = os.cpu_count()
-        allocate = cpu_count - cpu_count // 3 if cpu_count is not None else 1
-        if "OMP_NUM_THREADS" in os.environ:
-            # If this is set above NUMEXPR_MAX_THREADS, numexpr will error.
-            # ref: https://github.com/pydata/numexpr/issues/322
-            os.environ.pop("OMP_NUM_THREADS")
-        os.environ["NUMEXPR_MAX_THREADS"] = str(max(1, allocate))
-
-        # Ensure tensorflow doesn't pin all threads to one core when using Math Kernel Library
-        os.environ["TF_MIN_GPU_MULTIPROCESSOR_COUNT"] = "4"
-        os.environ["KMP_AFFINITY"] = "disabled"
-
-        # If running under CPU on Windows, the following error can be encountered:
-        # OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5 already initialized.
-        # OMP: Hint This means that multiple copies of the OpenMP runtime have been linked into
-        # the program. That is dangerous, since it can degrade performance or cause incorrect
-        # results. The best thing to do is to ensure that only a single OpenMP runtime is linked
-        # into the process, e.g. by avoiding static linking of the OpenMP runtime in any library.
-        # As an unsafe, unsupported, undocumented workaround you can set the environment variable
-        # KMP_DUPLICATE_LIB_OK=TRUE to allow the program to continue to execute, but that may cause
-        # crashes or silently produce incorrect results. For more information,
-        # please see http://www.intel.com/software/products/support/.
-        #
-        # TODO find a better way than just allowing multiple libs
-        if get_backend() == "cpu" and platform.system() == "Windows":
-            logger.debug("Setting `KMP_DUPLICATE_LIB_OK` environment variable to `TRUE`")
-            os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-        # There is a memory leak in TF2.10+ predict function. This fix will work for tf2.10 but not
-        # for later versions. This issue has been patched recently, but we'll probably need to
-        # skip some TF versions
-        # ref: https://github.com/tensorflow/tensorflow/issues/58676
-        # TODO remove this fix post TF2.10 and check memleak is fixed
-        logger.debug("Setting TF_RUN_EAGER_OP_AS_FUNCTION env var to False")
-        os.environ["TF_RUN_EAGER_OP_AS_FUNCTION"] = "false"
-
-    def _test_for_tf_version(self) -> None:
-        """ Check that the required Tensorflow version is installed.
+    def _test_for_torch_version(self) -> None:
+        """Check that the required PyTorch version is installed.
 
         Raises
         ------
         FaceswapError
-            If Tensorflow is not found, or is not between versions 2.4 and 2.9
+            If PyTorch is not found, or is not between versions 2.3 and 2.11
         """
-        min_ver = (2, 10)
-        max_ver = (2, 10)
+        min_ver = (2, 3)
+        max_ver = (2, 11)
         try:
-            import tensorflow as tf  # noqa pylint:disable=import-outside-toplevel,unused-import
+            import torch  # noqa:F401 pylint:disable=unused-import,import-outside-toplevel
         except ImportError as err:
-            if "DLL load failed while importing" in str(err):
-                msg = (
-                    f"A DLL library file failed to load. Make sure that you have Microsoft Visual "
-                    "C++ Redistributable (2015, 2017, 2019) installed for your machine from: "
-                    "https://support.microsoft.com/en-gb/help/2977003. Original error: "
-                    f"{str(err)}")
-            else:
-                msg = (
-                    f"There was an error importing Tensorflow. This is most likely because you do "
-                    "not have TensorFlow installed, or you are trying to run tensorflow-gpu on a "
-                    "system without an Nvidia graphics card. Original import "
-                    f"error: {str(err)}")
+            msg = (
+                f"There was an error importing PyTorch. This is most likely because you do "
+                f"not have PyTorch installed. Original import error: {str(err)}")
             self._handle_import_error(msg)
 
-        tf_ver = get_tf_version()
-        if tf_ver < min_ver:
-            msg = (f"The minimum supported Tensorflow is version {min_ver} but you have version "
-                   f"{tf_ver} installed. Please upgrade Tensorflow.")
+        torch_ver = get_torch_version()
+        if torch_ver < min_ver:
+            msg = (f"The minimum supported PyTorch is version {min_ver} but you have version "
+                   f"{torch_ver} installed. Please upgrade PyTorch.")
             self._handle_import_error(msg)
-        if tf_ver > max_ver:
-            msg = (f"The maximum supported Tensorflow is version {max_ver} but you have version "
-                   f"{tf_ver} installed. Please downgrade Tensorflow.")
+        if torch_ver > max_ver:
+            msg = (f"The maximum supported PyTorch is version {max_ver} but you have version "
+                   f"{torch_ver} installed. Please downgrade PyTorch.")
             self._handle_import_error(msg)
-        logger.debug("Installed Tensorflow Version: %s", tf_ver)
+        logger.debug("Installed PyTorch Version: %s", torch_ver)
 
     @classmethod
     def _handle_import_error(cls, message: str) -> None:
-        """ Display the error message to the console and wait for user input to dismiss it, if
+        """Display the error message to the console and wait for user input to dismiss it, if
         running GUI under Windows, otherwise use standard error handling.
 
         Parameters
         ----------
-        message: str
+        message
             The error message to display
         """
         if "gui" in sys.argv and platform.system() == "Windows":
@@ -150,7 +117,7 @@ class ScriptExecutor():
             raise FaceswapError(message)
 
     def _test_for_gui(self) -> None:
-        """ If running the gui, performs check to ensure necessary prerequisites are present. """
+        """If running the gui, performs check to ensure necessary prerequisites are present."""
         if self._command != "gui":
             return
         self._test_tkinter()
@@ -158,7 +125,7 @@ class ScriptExecutor():
 
     @classmethod
     def _test_tkinter(cls) -> None:
-        """ If the user is running the GUI, test whether the tkinter app is available on their
+        """If the user is running the GUI, test whether the tkinter app is available on their
         machine. If not exit gracefully.
 
         This avoids having to import every tkinter function within the GUI in a wrapper and
@@ -186,14 +153,14 @@ class ScriptExecutor():
 
     @classmethod
     def _check_display(cls) -> None:
-        """ Check whether there is a display to output the GUI to.
+        """Check whether there is a display to output the GUI to.
 
         If running on Windows then it is assumed that we are not running in headless mode
 
         Raises
         ------
         FaceswapError
-            If a DISPLAY environmental cannot be found
+            If a DISPLAY environmental variable cannot be found
         """
         if not os.environ.get("DISPLAY", None) and os.name != "nt":
             if platform.system() == "Darwin":
@@ -202,17 +169,16 @@ class ScriptExecutor():
             raise FaceswapError("No display detected. GUI mode has been disabled.")
 
     def execute_script(self, arguments: argparse.Namespace) -> None:
-        """ Performs final set up and launches the requested :attr:`_command` with the given
+        """Performs final set up and launches the requested :attr:`_command` with the given
         command line arguments.
 
         Monitors for errors and attempts to shut down the process cleanly on exit.
 
         Parameters
         ----------
-        arguments: :class:`argparse.Namespace`
+        arguments
             The command line arguments to be passed to the executing script.
         """
-        set_system_verbosity(arguments.loglevel)
         is_gui = hasattr(arguments, "redirect_gui") and arguments.redirect_gui
         log_setup(arguments.loglevel, arguments.logfile, self._command, is_gui)
         success = False
@@ -243,7 +209,7 @@ class ScriptExecutor():
             safe_shutdown(got_error=not success)
 
     def _configure_backend(self, arguments: argparse.Namespace) -> None:
-        """ Configure the backend.
+        """Configure the backend.
 
         Exclude any GPUs for use by Faceswap when requested.
 
@@ -251,7 +217,7 @@ class ScriptExecutor():
 
         Parameters
         ----------
-        arguments: :class:`argparse.Namespace`
+        arguments
             The command line arguments passed to Faceswap.
         """
         if not hasattr(arguments, "exclude_gpus"):
@@ -260,13 +226,14 @@ class ScriptExecutor():
             setattr(arguments, "exclude_gpus", None)
             return
 
+        assert GPUStats is not None
         if arguments.exclude_gpus:
             if not all(idx.isdigit() for idx in arguments.exclude_gpus):
                 logger.error("GPUs passed to the ['-X', '--exclude-gpus'] argument must all be "
                              "integers.")
                 sys.exit(1)
             arguments.exclude_gpus = [int(idx) for idx in arguments.exclude_gpus]
-            set_exclude_devices(arguments.exclude_gpus)
+            GPUStats().exclude_devices(arguments.exclude_gpus)
 
         if GPUStats().exclude_all_devices:
             msg = "Switching backend to CPU"
@@ -274,3 +241,6 @@ class ScriptExecutor():
             logger.info(msg)
 
         logger.debug("Executing: %s. PID: %s", self._command, os.getpid())
+
+
+__all__ = get_module_objects(__name__)
